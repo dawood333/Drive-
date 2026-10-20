@@ -49,7 +49,7 @@ jobs:
           report = []
           if len(image) < 32:
               raise SystemExit(f"ERROR: image too small ({len(image)} bytes)")
-          magic, total_size, header_size, entry_size, count, entries_offset, page_size, version = struct.unpack_from("<8I", image, 0)
+          magic, total_size, header_size, entry_size, count, entries_offset, page_size, version = struct.unpack_from(">8I", image, 0)
           report += [
               "DTBO analysis report",
               "====================",
@@ -74,7 +74,7 @@ jobs:
           interesting = re.compile(r"compatible|model|lcm|panel|touch|goodix|focaltech|gamekey|hall|vibrator|haptic|aw8697|fingerprint|accdet|mt6360|gps|lna|videolfb|pinctrl|thermal|regulator", re.I)
           for i in range(count):
               pos = entries_offset + i * entry_size
-              fields = struct.unpack_from("<8I", image, pos)
+              fields = struct.unpack_from(">8I", image, pos)
               dt_size, dt_offset, dt_id, dt_rev, *custom = fields
               report.append(f"Overlay {i}: size={dt_size}, offset={dt_offset}, id={dt_id}, rev={dt_rev}, custom={custom}")
               if dt_size == 0 or dt_offset + dt_size > len(image):
