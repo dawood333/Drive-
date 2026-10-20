@@ -1,0 +1,125 @@
+name: Analyze DTBO
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_url:
+        description: "Direct URL to dtbo.img (defaults to this repository's main/dtbo.img)"
+        required: true
+        default: "https://raw.githubusercontent.com/dawood333/Drive-/main/dtbo.img"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install device-tree tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y device-tree-compiler python3
+
+      - name: Download DTBO image
+        env:
+          IMAGE_URL: ${{ inputs.image_url }}
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --output dtbo.img "$IMAGE_URL"
+          test -s dtbo.img
+          sha256sum dtbo.img | tee sha256.txt
+          file dtbo.img | tee file-info.txt
+          xxd -l 64 dtbo.img | tee header-hex.txt
+
+      - name: Parse DTBO table and decompile overlays
+        run: |
+          set -euo pipefail
+          mkdir -p analysis/overlays
+          cat > /tmp/analyze_dtbo.py <<'PY'
+          import os, re, struct, subprocess, sys
+          from pathlib import Path
+
+          image = Path("dtbo.img").read_bytes()
+          out = Path("analysis")
+          report = []
+          if len(image) < 32:
+              raise SystemExit(f"ERROR: image too small ({len(image)} bytes)")
+          magic, total_size, header_size, entry_size, count, entries_offset, page_size, version = struct.unpack_from("<8I", image, 0)
+          report += [
+              "DTBO analysis report",
+              "====================",
+              f"Image size: {len(image)} bytes",
+              f"Magic: 0x{magic:08x} (expected 0xd7b7ab1e)",
+              f"Header total_size: {total_size}",
+              f"Header size: {header_size}",
+              f"Entry size: {entry_size}",
+              f"Entry count: {count}",
+              f"Entries offset: {entries_offset}",
+              f"Page size: {page_size}",
+              f"Version: {version}",
+              ""
+          ]
+          if magic != 0xd7b7ab1e:
+              (out / "report.txt").write_text("\n".join(report + ["Not a standard Android DT table. No entries extracted."]), encoding="utf-8")
+              raise SystemExit("Image does not have standard DT table magic 0xd7b7ab1e; inspect header-hex.txt and file-info.txt.")
+          if header_size < 32 or entry_size < 32 or count > 4096:
+              raise SystemExit("Invalid/untrusted DT table header values.")
+          if entries_offset + count * entry_size > len(image):
+              raise SystemExit("DT table entry list exceeds image size.")
+          interesting = re.compile(r"compatible|model|lcm|panel|touch|goodix|focaltech|gamekey|hall|vibrator|haptic|aw8697|fingerprint|accdet|mt6360|gps|lna|videolfb|pinctrl|thermal|regulator", re.I)
+          for i in range(count):
+              pos = entries_offset + i * entry_size
+              fields = struct.unpack_from("<8I", image, pos)
+              dt_size, dt_offset, dt_id, dt_rev, *custom = fields
+              report.append(f"Overlay {i}: size={dt_size}, offset={dt_offset}, id={dt_id}, rev={dt_rev}, custom={custom}")
+              if dt_size == 0 or dt_offset + dt_size > len(image):
+                  report.append("  ERROR: entry data range is invalid")
+                  continue
+              blob = image[dt_offset:dt_offset + dt_size]
+              name = f"overlay_{i:03d}"
+              dtb_path = out / "overlays" / f"{name}.dtb"
+              dts_path = out / "overlays" / f"{name}.dts"
+              dtb_path.write_bytes(blob)
+              if len(blob) >= 4 and blob[:4] == b"\xd0\x0d\xfe\xed":
+                  proc = subprocess.run(["dtc", "-I", "dtb", "-O", "dts", "-o", str(dts_path), str(dtb_path)], text=True, capture_output=True)
+                  if proc.returncode == 0:
+                      text = dts_path.read_text(encoding="utf-8", errors="replace")
+                      matches = []
+                      for line in text.splitlines():
+                          if interesting.search(line):
+                              matches.append(line.strip())
+                      report.append(f"  Decompiled: {dts_path}")
+                      report.append("  Key properties/nodes:")
+                      report.extend("    " + x for x in matches[:250])
+                      if len(matches) > 250:
+                          report.append(f"    ... {len(matches)-250} more matching lines (see full DTS)")
+                      if proc.stderr.strip():
+                          report.append("  dtc warnings: " + proc.stderr.strip().replace("\n", " | "))
+                  else:
+                      report.append("  dtc failed: " + proc.stderr.strip().replace("\n", " | "))
+              else:
+                  report.append(f"  WARNING: overlay {i} does not start with FDT magic; saved raw entry only.")
+              report.append("")
+          (out / "report.txt").write_text("\n".join(report), encoding="utf-8")
+          print("\n".join(report[:1000]))
+          PY
+          python3 /tmp/analyze_dtbo.py
+
+      - name: Upload analysis results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtbo-analysis
+          path: |
+            dtbo.img
+            analysis/
+            sha256.txt
+            file-info.txt
+            header-hex.txt
+          if-no-files-found: warn
+          retention-days: 14
